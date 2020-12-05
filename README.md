@@ -1,2 +1,2 @@
 # handy
-Handy day to day tools
+Handy day-to-day tools

@@ -1,0 +1,116 @@
+#!/usr/bin/env bash
+# Re-syncs Nvidia's DP-MST state with the dock after a hot-replug, and
+# positions external monitors in a fixed left-to-right order by EDID serial
+# (so the layout stays correct even if DP-1.2 / DP-1.3 swap on enumeration).
+#
+# Edit MONITOR_ORDER below if you add/replace a monitor.
+
+set -u
+
+# Physical left-to-right order, by EDID serial number.
+MONITOR_ORDER=(
+  "JZS2WW2"  # left  — Dell P2419H
+  "8CHTPD3"  # right — Dell P2419H
+)
+
+# Which monitor (by serial) should be the X primary output.
+PRIMARY_SERIAL="8CHTPD3"
+
+log() { printf '[fix-dock-displays] %s\n' "$*"; }
+die() { printf '[fix-dock-displays] ERROR: %s\n' "$*" >&2; exit 1; }
+
+command -v xrandr  >/dev/null || die "xrandr not found"
+command -v python3 >/dev/null || die "python3 not found"
+
+log "Step 1/4: Re-probing kernel DRM connectors (sudo required)..."
+sudo bash -c '
+  shopt -s nullglob
+  for c in /sys/class/drm/card*-DP-*/status; do
+    echo detect > "$c" 2>/dev/null || true
+  done
+'
+sleep 1
+
+log "Step 2/4: Reading EDID serials from connected outputs..."
+# Emits "<output> <serial>" lines, one per connected output that has an EDID.
+mapfile -t pairs < <(python3 - <<'PY'
+import re, subprocess
+out = subprocess.check_output(["xrandr","--props"], text=True)
+cur, capture = None, False
+edids = {}
+for line in out.splitlines():
+    m = re.match(r'^([A-Za-z0-9_.-]+) (connected|disconnected)', line)
+    if m:
+        cur = m.group(1) if m.group(2) == "connected" else None
+        if cur: edids[cur] = []
+        capture = False
+        continue
+    if cur is None: continue
+    if line.strip().startswith("EDID:"):
+        capture = True; continue
+    if capture:
+        if re.match(r'^\s+[0-9a-fA-F]+\s*$', line):
+            edids[cur].append(line.strip())
+        else:
+            capture = False
+for o, parts in edids.items():
+    hex_str = "".join(parts)
+    if not hex_str: continue
+    data = bytes.fromhex(hex_str)
+    serial = ""
+    for off in (54, 72, 90, 108):
+        block = data[off:off+18]
+        if block[:3] == b'\x00\x00\x00' and block[3] == 0xff:
+            serial = block[5:18].decode('ascii', errors='replace').strip()
+            break
+    print(f"{o} {serial}")
+PY
+)
+
+declare -A serial_to_output
+for line in "${pairs[@]}"; do
+  out_name="${line%% *}"
+  serial="${line#* }"
+  [[ -z "$serial" ]] && continue
+  serial_to_output["$serial"]="$out_name"
+  log "  $out_name -> serial $serial"
+done
+
+log "Step 3/4: Disabling all connected DP outputs..."
+off_args=()
+for line in "${pairs[@]}"; do
+  out_name="${line%% *}"
+  off_args+=(--output "$out_name" --off)
+done
+[[ ${#off_args[@]} -gt 0 ]] && xrandr "${off_args[@]}"
+sleep 1
+
+log "Step 4/4: Enabling monitors in configured left-to-right order..."
+on_args=()
+prev=""
+for serial in "${MONITOR_ORDER[@]}"; do
+  out_name="${serial_to_output[$serial]:-}"
+  if [[ -z "$out_name" ]]; then
+    log "  (serial $serial not currently connected — skipping)"
+    continue
+  fi
+  on_args+=(--output "$out_name" --auto)
+  if [[ -z "$prev" ]]; then
+    on_args+=(--pos 0x0)
+    pos_desc="left"
+  else
+    on_args+=(--right-of "$prev")
+    pos_desc="right of $prev"
+  fi
+  if [[ "$serial" == "$PRIMARY_SERIAL" ]]; then
+    on_args+=(--primary)
+    pos_desc="$pos_desc (primary)"
+  fi
+  log "  $out_name (serial $serial) -> $pos_desc"
+  prev="$out_name"
+done
+
+[[ ${#on_args[@]} -eq 0 ]] && die "no known monitors found among connected outputs"
+xrandr "${on_args[@]}"
+
+log "Done. Verify with: xrandr --query"
